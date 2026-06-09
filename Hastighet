@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Hastighetsmätare</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0a0a0f; --surface: #12121a; --needle: #ff3b30;
+      --arc-safe: #34c759; --arc-mid: #ff9500; --arc-active: #ff3b30;
+      --text-primary: #ffffff; --text-dim: rgba(255,255,255,0.45);
+    }
+    html, body { height: 100%; background: var(--bg); font-family: -apple-system, 'Helvetica Neue', sans-serif; -webkit-tap-highlight-color: transparent; user-select: none; overflow: hidden; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: env(safe-area-inset-top, 20px) 0 env(safe-area-inset-bottom, 16px); }
+    #header { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 8px 20px 0; }
+    #gps-status { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); letter-spacing: 0.04em; }
+    #gps-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); transition: background 0.4s; }
+    #gps-dot.active { background: #34c759; box-shadow: 0 0 6px #34c759; }
+    #gps-dot.searching { background: #ff9500; animation: pulse 1.2s ease-in-out infinite; }
+    #gps-dot.error { background: #ff3b30; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    #unit-toggle { font-size: 12px; background: none; border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 3px 10px; color: var(--text-dim); letter-spacing: 0.06em; cursor: pointer; -webkit-appearance: none; }
+    #gauge-wrap { position: relative; width: 310px; height: 310px; flex-shrink: 0; }
+    #gauge-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    #digital { position: absolute; bottom: 42px; left: 0; right: 0; text-align: center; line-height: 1; }
+    #speed-value { font-size: 72px; font-weight: 200; letter-spacing: -3px; color: var(--text-primary); font-variant-numeric: tabular-nums; transition: color 0.3s; }
+    #speed-unit { font-size: 14px; letter-spacing: 0.12em; color: var(--text-dim); margin-top: 2px; }
+    #stats { width: 100%; display: flex; justify-content: space-around; padding: 0 16px; }
+    .stat { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+    .stat-label { font-size: 10px; letter-spacing: 0.1em; color: var(--text-dim); text-transform: uppercase; }
+    .stat-value { font-size: 18px; font-weight: 300; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+    .stat-sub { font-size: 10px; color: var(--text-dim); }
+    #message { position: fixed; inset: 0; background: rgba(10,10,15,0.92); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; z-index: 10; padding: 32px; text-align: center; }
+    #message.hidden { display: none; }
+    #msg-icon { font-size: 40px; }
+    #msg-title { font-size: 20px; font-weight: 500; color: var(--text-primary); }
+    #msg-text { font-size: 14px; color: var(--text-dim); line-height: 1.5; max-width: 280px; }
+    #msg-btn { margin-top: 8px; padding: 12px 28px; background: #ff3b30; border: none; border-radius: 22px; color: white; font-size: 16px; font-weight: 500; cursor: pointer; -webkit-appearance: none; }
+  </style>
+</head>
+<body>
+  <div id="message">
+    <div id="msg-icon">📍</div>
+    <div id="msg-title">Platsbehörighet krävs</div>
+    <div id="msg-text">Hastighetsmätaren behöver åtkomst till din GPS för att fungera.</div>
+    <button id="msg-btn" onclick="startGPS()">Tillåt plats</button>
+  </div>
+  <div id="header">
+    <div id="gps-status">
+      <div id="gps-dot"></div>
+      <span id="gps-label">Söker GPS…</span>
+    </div>
+    <button id="unit-toggle" onclick="toggleUnit()">KM/H</button>
+  </div>
+  <div id="gauge-wrap">
+    <canvas id="gauge-canvas" width="620" height="620"></canvas>
+    <div id="digital">
+      <div id="speed-value">0</div>
+      <div id="speed-unit">km/h</div>
+    </div>
+  </div>
+  <div id="stats">
+    <div class="stat">
+      <div class="stat-label">Max</div>
+      <div class="stat-value" id="max-speed">0</div>
+      <div class="stat-sub" id="max-unit">km/h</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Noggrannhet</div>
+      <div class="stat-value" id="accuracy">–</div>
+      <div class="stat-sub">meter</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Höjd</div>
+      <div class="stat-value" id="altitude">–</div>
+      <div class="stat-sub">meter</div>
+    </div>
+  </div>
+<script>
+  let useKmh = true, currentSpeedMs = 0, maxSpeedMs = 0, watchId = null;
+  let displayedAngle = 135;
+  const MAX_KMH = 200, MAX_MPH = 125, SWEEP = 270;
+  const canvas = document.getElementById('gauge-canvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height, cx = W/2, cy = H/2, R = W*0.42;
+
+  function degToRad(d) { return d * Math.PI / 180; }
+  function toDisplay(ms) { return useKmh ? ms * 3.6 : ms * 2.23694; }
+  function speedToAngle(spd) {
+    const max = useKmh ? MAX_KMH : MAX_MPH;
+    return 135 + Math.min(spd / max, 1) * SWEEP;
+  }
+
+  function drawGauge(angle) {
+    ctx.clearRect(0, 0, W, H);
+    const startRad = degToRad(135), endRad = degToRad(135 + SWEEP);
+    ctx.beginPath(); ctx.arc(cx, cy, R, startRad, endRad);
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 18; ctx.lineCap = 'round'; ctx.stroke();
+    const pct = (angle - 135) / SWEEP;
+    function arcSeg(from, to, color) {
+      if (to <= from) return;
+      ctx.beginPath(); ctx.arc(cx, cy, R, degToRad(135 + from*SWEEP), degToRad(135 + to*SWEEP));
+      ctx.strokeStyle = color; ctx.lineWidth = 18; ctx.lineCap = 'butt'; ctx.stroke();
+    }
+    if (pct > 0) {
+      arcSeg(0, Math.min(pct, 0.6), '#34c759');
+      if (pct > 0.6) arcSeg(0.6, Math.min(pct, 0.8), '#ff9500');
+      if (pct > 0.8) arcSeg(0.8, pct, '#ff3b30');
+    }
+    const maxSpd = useKmh ? MAX_KMH : MAX_MPH;
+    const step = useKmh ? 20 : 10, major = useKmh ? 40 : 20;
+    for (let s = 0; s <= maxSpd; s += step) {
+      const a = degToRad(135 + (s/maxSpd)*SWEEP), isMaj = s % major === 0;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a)*(R-(isMaj?26:14)), cy + Math.sin(a)*(R-(isMaj?26:14)));
+      ctx.lineTo(cx + Math.cos(a)*(R-2), cy + Math.sin(a)*(R-2));
+      ctx.strokeStyle = isMaj ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.2)';
+      ctx.lineWidth = isMaj ? 2.5 : 1.5; ctx.stroke();
+      if (isMaj) {
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.font = `bold ${W*0.045}px -apple-system,sans-serif`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(s, cx + Math.cos(a)*(R-44), cy + Math.sin(a)*(R-44));
+      }
+    }
+    const nr = degToRad(angle);
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(nr);
+    ctx.shadowColor = '#ff3b30'; ctx.shadowBlur = 16;
+    ctx.beginPath(); ctx.moveTo(-28, 0); ctx.lineTo(R-28, 0);
+    ctx.strokeStyle = '#ff3b30'; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.arc(0, 0, 11, 0, Math.PI*2);
+    ctx.fillStyle = '#1c1c24'; ctx.fill();
+    ctx.strokeStyle = '#ff3b30'; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.restore();
+  }
+
+  function animate() {
+    const target = speedToAngle(toDisplay(currentSpeedMs));
+    displayedAngle += (target - displayedAngle) * 0.18;
+    drawGauge(displayedAngle);
+    const spd = Math.round(toDisplay(currentSpeedMs));
+    const el = document.getElementById('speed-value');
+    el.textContent = spd;
+    el.style.color = spd > (useKmh?120:75) ? '#ff3b30' : spd > (useKmh?80:50) ? '#ff9500' : '#ffffff';
+    requestAnimationFrame(animate);
+  }
+
+  function toggleUnit() {
+    useKmh = !useKmh;
+    document.getElementById('unit-toggle').textContent = useKmh ? 'KM/H' : 'MPH';
+    document.getElementById('speed-unit').textContent = useKmh ? 'km/h' : 'mph';
+    document.getElementById('max-unit').textContent = useKmh ? 'km/h' : 'mph';
+    document.getElementById('max-speed').textContent = Math.round(toDisplay(maxSpeedMs));
+  }
+
+  function startGPS() {
+    document.getElementById('message').classList.add('hidden');
+    setGpsStatus('searching', 'Söker GPS…');
+    if (!navigator.geolocation) { showError('GPS saknas', 'Din webbläsare stöder inte geolokalisering.'); return; }
+    navigator.geolocation.watchPosition(onPosition, onError, { enableHighAccuracy: true, maximumAge: 500, timeout: 10000 });
+  }
+
+  function onPosition(pos) {
+    setGpsStatus('active', 'GPS aktiv');
+    currentSpeedMs = (pos.coords.speed !== null && pos.coords.speed >= 0) ? pos.coords.speed : 0;
+    if (currentSpeedMs > maxSpeedMs) {
+      maxSpeedMs = currentSpeedMs;
+      document.getElementById('max-speed').textContent = Math.round(toDisplay(maxSpeedMs));
+    }
+    const acc = pos.coords.accuracy;
+    document.getElementById('accuracy').textContent = acc < 999 ? Math.round(acc) : '–';
+    const alt = pos.coords.altitude;
+    document.getElementById('altitude').textContent = alt !== null ? Math.round(alt) : '–';
+  }
+
+  function onError(err) {
+    if (err.code === 1) showError('Åtkomst nekad', 'Tillåt platstjänster för Safari i Inställningar → Integritet → Platstjänster.');
+    else if (err.code === 2) setGpsStatus('error', 'GPS ej tillgänglig');
+    else setGpsStatus('searching', 'Söker…');
+  }
+
+  function showError(title, text) {
+    document.getElementById('msg-icon').textContent = '⚠️';
+    document.getElementById('msg-title').textContent = title;
+    document.getElementById('msg-text').textContent = text;
+    document.getElementById('msg-btn').style.display = 'none';
+    document.getElementById('message').classList.remove('hidden');
+  }
+
+  function setGpsStatus(state, label) {
+    const dot = document.getElementById('gps-dot');
+    dot.className = ''; dot.classList.add(state);
+    document.getElementById('gps-label').textContent = label;
+  }
+
+  if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(()=>{});
+  animate();
+</script>
+</body>
+</html>
